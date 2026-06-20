@@ -554,8 +554,13 @@ function saveSimulatorSessionToTracker(evalReport) {
   const today = new Date().toISOString().slice(0, 10);
   const hidden = simulatorState.hiddenState;
   
-  const resistance = hidden ? parseInt(hidden.resistanceLevel) : 0;
-  const risk = hidden ? parseInt(hidden.riskFlag) : 0;
+  const resistance = (hidden && !isNaN(parseInt(hidden.resistanceLevel))) 
+    ? parseInt(hidden.resistanceLevel) 
+    : (parseInt(simulatorState.constructorConfig.resist) || 0);
+    
+  const risk = (hidden && !isNaN(parseInt(hidden.riskFlag))) 
+    ? parseInt(hidden.riskFlag) 
+    : (parseInt(simulatorState.constructorConfig.risk) || 0);
   
   const pacs = Array(5).fill(resistance);
   const gad7 = Array(7).fill(0);
@@ -572,13 +577,132 @@ function saveSimulatorSessionToTracker(evalReport) {
     phq9: phq9,
     isPractice: true,
     dialogue: JSON.parse(JSON.stringify(simulatorState.log)),
-    ctsReport: evalReport
+    ctsReport: evalReport,
+    hiddenState: hidden ? JSON.parse(JSON.stringify(hidden)) : null,
+    patientCard: simulatorState.patientCard
   };
   
   patient.records.push(record);
   patient.records.sort((a, b) => a.date.localeCompare(b.date));
   
   storage.savePatients(patients);
+}
+
+// Запуск повторної сесії для існуючого пацієнта
+async function startRepeatSimulatorSession(patient) {
+  if (busy) return;
+  
+  if (!settings.apiKey) {
+    alert("Будь ласка, вкажіть ваш API-ключ у вкладці «Налаштування» перед початком симуляції.");
+    switchTab('tab-settings');
+    return;
+  }
+
+  const practiceRecords = patient.records.filter(r => r.isPractice);
+  if (practiceRecords.length === 0) {
+    alert("Не знайдено попередніх практичних сесій цього пацієнта.");
+    return;
+  }
+  
+  const lastRecord = practiceRecords[practiceRecords.length - 1];
+  
+  // Видобуваємо картку пацієнта
+  const cardItem = lastRecord.dialogue ? lastRecord.dialogue.find(it => it.type === 'card') : null;
+  const patientCard = lastRecord.patientCard || (cardItem ? cardItem.text : '');
+  
+  if (!patientCard) {
+    alert("Не вдалося знайти медичну картку пацієнта.");
+    return;
+  }
+  
+  // Видобуваємо ім'я пацієнта
+  let patientName = "Пацієнт";
+  const nameMatch = patientCard.match(/Ім'я, вік:\s*(.*)/i);
+  if (nameMatch && nameMatch[1]) {
+    patientName = nameMatch[1].trim();
+  } else {
+    patientName = patient.code.replace(/^Т-/, '');
+  }
+  
+  // Відтворюємо прихований стан (з фолбеком для старих записів)
+  const hiddenState = lastRecord.hiddenState || {
+    trigger: lastRecord.trigger || 'тригер вживання',
+    coreBelief: 'необхідно виявити під час діалогу',
+    resistanceLevel: lastRecord.pacs ? lastRecord.pacs[0] : 3,
+    resistanceMechanism: 'intellectualisation',
+    hiddenFear: 'необхідно виявити під час діалогу',
+    riskFlag: lastRecord.phq9 ? lastRecord.phq9[8] : 0
+  };
+  
+  const sessionNumber = practiceRecords.length + 1;
+  
+  // Визначаємо етап лікування з картки пацієнта
+  const stageMatch = patientCard.match(/Етап лікування:\s*(.*)/i);
+  const stage = stageMatch ? stageMatch[1].trim() : "рання реабілітація";
+  
+  // Готуємо тренажер
+  resetSimulatorSession();
+  
+  busy = true;
+  setSimulatorBusyState(true);
+  switchTab('tab-simulator');
+  
+  showThinkingIndicator('chat-feed', 'ШІ готує повторний прийом...');
+  
+  try {
+    const result = await api.generateRepeatSession(
+      settings,
+      hiddenState,
+      patientCard,
+      sessionNumber,
+      stage,
+      patientName
+    );
+    
+    // Заповнюємо стан симулятора
+    simulatorState.patientCard = patientCard;
+    simulatorState.activeName = patientName;
+    simulatorState.hiddenState = hiddenState;
+    
+    simulatorState.log = [];
+    simulatorState.chatHistory = [];
+    
+    // Додаємо картку до логу
+    simulatorState.log.push({ type: 'card', text: patientCard });
+    
+    // Вступна репліка повторного прийому
+    if (result.patient) {
+      simulatorState.chatHistory.push({ role: 'assistant', content: result.patient });
+      simulatorState.log.push({ type: 'patient', text: result.patient });
+    }
+    
+    // Перша підказка супервізора
+    if (result.hint) {
+      simulatorState.log.push({ type: 'hint', text: '', hint: result.hint });
+    }
+    
+    saveSimulator();
+    renderSimulator();
+    
+    // Активуємо інпути
+    $('chat-input').disabled = false;
+    $('btn-send-message').disabled = false;
+    $('btn-voice-input').disabled = false;
+    
+    // Мобільне згортання конструктора
+    if (window.innerWidth <= 960) {
+      $('toggle-constructor-btn').closest('.constructor-card').classList.add('collapsed');
+      $('toggle-constructor-btn').textContent = 'Розгорнути';
+    }
+    
+    $('chat-input').focus();
+    
+  } catch (e) {
+    showErrorIndicator('chat-feed', e.message);
+  } finally {
+    busy = false;
+    setSimulatorBusyState(false);
+  }
 }
 
 // Запуск/зупинка розпізнавання голосу
@@ -936,9 +1060,16 @@ function renderTrackerForm() {
   }
   
   const today = new Date().toISOString().slice(0, 10);
+  const isTrainerPatient = p.code.startsWith('Т-');
+  const repeatBtnHtml = isTrainerPatient 
+    ? `<button id="btn-repeat-session" class="ghost-btn" style="font-size: 13px; padding: 6px 12px; border: 1px solid var(--primary); color: var(--primary); cursor: pointer; display: inline-flex; align-items: center; gap: 4px; border-radius: 6px; background: transparent; transition: background 0.2s, color 0.2s;">🛋️ Повторний прийом</button>`
+    : '';
   
   container.innerHTML = `
-    <div class="patient-code-title">${escapeHtml(p.code)}</div>
+    <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; flex-wrap: wrap;">
+      <div class="patient-code-title" style="margin-bottom: 0;">${escapeHtml(p.code)}</div>
+      ${repeatBtnHtml}
+    </div>
     
     <div class="input-group">
       <label for="p-note">Діагноз / Опис випадку</label>
@@ -1006,6 +1137,15 @@ function renderTrackerForm() {
   };
 
   $('btn-save-record').onclick = saveSessionRecord;
+
+  if (isTrainerPatient) {
+    const btnRepeat = $('btn-repeat-session');
+    if (btnRepeat) {
+      btnRepeat.onclick = () => {
+        startRepeatSimulatorSession(p);
+      };
+    }
+  }
   
   // Оновлюємо історію
   renderHistoryTable(p);
@@ -1301,7 +1441,24 @@ function renderInterpretation(recs) {
   const box = $('chart-interpretation');
   
   if (recs.length < 2) {
-    box.innerHTML = `<div class="read-box">Потрібно мінімум 2 записи в історії, щоб ШІ міг проаналізувати динаміку на тлі тверезості.</div>`;
+    if (recs.length === 1) {
+      const lastRec = recs[0];
+      const pacsSum = lastRec.pacs.reduce((a,b)=>a+b, 0);
+      const gad7Sum = lastRec.gad7.reduce((a,b)=>a+b, 0);
+      const phq9Sum = lastRec.phq9.reduce((a,b)=>a+b, 0);
+      
+      let text = `📊 <b>Поточний стан:</b> На основі першої сесії у пацієнта виявлено:<br>`;
+      text += `- Крейвінг (PACS): <b>${pacsSum}</b> балів (${pacsSum >= 15 ? '<span style="color:var(--accent); font-weight:bold;">перевищує поріг ризику зриву</span>' : 'в межах норми'}).<br>`;
+      text += `- Тривога (GAD-7): <b>${gad7Sum}</b> балів (${gad7Sum >= 10 ? '<span style="color:var(--anx); font-weight:bold;">помірна/сильна тривога</span>' : 'норма'}).<br>`;
+      text += `- Депресія (PHQ-9): <b>${phq9Sum}</b> балів (${phq9Sum >= 10 ? '<span style="color:var(--dep); font-weight:bold;">помірна/сильна депресія</span>' : 'норма'}).<br>`;
+      if (lastRec.phq9 && lastRec.phq9[8] > 0) {
+        text += `🚨 <strong style="color:var(--anx);">УВАГА:</strong> Виявлено суїцидальні думки! Потрібно обов'язково перевірити наявність контракту безпеки.<br>`;
+      }
+      text += `<br><i>Збережіть ще хоча б одну сесію для цього пацієнта, щоб побудувати графік та розрахувати динаміку змін у часі.</i>`;
+      box.innerHTML = `<div class="read-box info">${text}</div>`;
+    } else {
+      box.innerHTML = `<div class="read-box">Потрібно мінімум 2 записи в історії, щоб ШІ міг проаналізувати динаміку на тлі тверезості.</div>`;
+    }
     return;
   }
   

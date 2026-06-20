@@ -266,6 +266,27 @@ export const api = {
     return responseText;
   },
 
+  // Згенерувати повторну сесію (повторний прийом)
+  async generateRepeatSession(settings, hiddenState, patientCard, sessionNumber, stage, patientName) {
+    const system = getSystemPrompt(settings.customSystemPrompt, hiddenState, patientCard);
+    
+    const prompt = `Це повторний прийом (сесія №${sessionNumber}) з пацієнтом ${patientName}.
+Пацієнт пам'ятає попередню розмову. Етап лікування: ${stage}.
+Напиши першу репліку пацієнта на початку цієї нової сесії (наприклад, як він заходить у кабінет і вітається, розповідає про свій стан з минулого тижня).
+Поверни JSON з полями "patient" (тільки вступна репліка пацієнта від першої особи) та "hint" (перша підказка супервізора).`;
+
+    const messages = [{ role: "user", content: prompt }];
+
+    let responseText;
+    if (settings.apiProvider === 'anthropic') {
+      responseText = await callAnthropic(settings, system, messages);
+    } else {
+      responseText = await callOpenAI(settings, [{ role: "system", content: system }, ...messages], true);
+    }
+
+    return this.parseResponse(responseText);
+  },
+
   // Допоміжний метод парсингу JSON
   parseResponse(text) {
     let cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
